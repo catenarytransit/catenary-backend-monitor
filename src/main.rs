@@ -12,12 +12,13 @@ const BACKENDS: &[&str] = &[
     "https://ramonda.catenarymaps.org",
 ];
 
-const PING_USER_IDS: &[&str] = &[
-    "204371573799518208",
-];
+const PING_USER_IDS: &[&str] = &["204371573799518208"];
 
-// How frequently we check whether a backend has recovered.
+// How frequently each backend is health checked.
 const CHECK_INTERVAL: Duration = Duration::from_secs(10);
+
+// A backend must fail continuously for this long before it is considered down.
+const FAILURE_CONFIRMATION_WINDOW: Duration = Duration::from_secs(30);
 
 // How frequently Discord is notified while a backend remains down.
 const ALERT_INTERVAL: Duration = Duration::from_secs(60);
@@ -64,6 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn monitor_backend(client: Client, webhook_url: String, url: &'static str) {
     let mut was_down = false;
+    let mut failure_started_at: Option<Instant> = None;
     let mut last_alert: Option<Instant> = None;
 
     let mut ticker = time::interval(CHECK_INTERVAL);
@@ -76,6 +78,9 @@ async fn monitor_backend(client: Client, webhook_url: String, url: &'static str)
 
         match check_backend(&client, url).await {
             Ok(status) if status.is_success() => {
+                // A successful check breaks the continuous-failure window.
+                failure_started_at = None;
+
                 if was_down {
                     was_down = false;
                     last_alert = None;
@@ -89,12 +94,8 @@ async fn monitor_backend(client: Client, webhook_url: String, url: &'static str)
                     );
 
                     // Recovery message intentionally does not ping users.
-                    if let Err(error) =
-                        send_webhook(&client, &webhook_url, &message, false).await
-                    {
-                        eprintln!(
-                            "Failed to send recovery webhook for {url}: {error}"
-                        );
+                    if let Err(error) = send_webhook(&client, &webhook_url, &message, false).await {
+                        eprintln!("Failed to send recovery webhook for {url}: {error}");
                     }
                 }
             }
@@ -107,6 +108,7 @@ async fn monitor_backend(client: Client, webhook_url: String, url: &'static str)
                     &webhook_url,
                     url,
                     &reason,
+                    &mut failure_started_at,
                     &mut was_down,
                     &mut last_alert,
                 )
@@ -121,6 +123,7 @@ async fn monitor_backend(client: Client, webhook_url: String, url: &'static str)
                     &webhook_url,
                     url,
                     &reason,
+                    &mut failure_started_at,
                     &mut was_down,
                     &mut last_alert,
                 )
@@ -130,10 +133,7 @@ async fn monitor_backend(client: Client, webhook_url: String, url: &'static str)
     }
 }
 
-async fn check_backend(
-    client: &Client,
-    url: &str,
-) -> Result<StatusCode, reqwest::Error> {
+async fn check_backend(client: &Client, url: &str) -> Result<StatusCode, reqwest::Error> {
     let response = client.get(url).send().await?;
     Ok(response.status())
 }
@@ -143,21 +143,45 @@ async fn handle_failure(
     webhook_url: &str,
     url: &str,
     reason: &str,
+    failure_started_at: &mut Option<Instant>,
     was_down: &mut bool,
     last_alert: &mut Option<Instant>,
 ) {
     let now = Instant::now();
 
-    let first_failure = !*was_down;
-    *was_down = true;
+    if !*was_down {
+        match *failure_started_at {
+            Some(first_failure_at) => {
+                let down_for = now.duration_since(first_failure_at);
 
-    let alert_due = first_failure
-        || match *last_alert {
-            Some(previous_alert) => {
-                now.duration_since(previous_alert) >= ALERT_INTERVAL
+                if down_for < FAILURE_CONFIRMATION_WINDOW {
+                    eprintln!(
+                        "SUSPECTED DOWN: {url} - {reason} \
+                         (failing for {}s; waiting for 30s confirmation)",
+                        down_for.as_secs()
+                    );
+                    return;
+                }
             }
-            None => true,
-        };
+            None => {
+                *failure_started_at = Some(now);
+
+                eprintln!(
+                    "SUSPECTED DOWN: {url} - {reason} \
+                     (starting 30s confirmation window)"
+                );
+                return;
+            }
+        }
+
+        *was_down = true;
+        *failure_started_at = None;
+    }
+
+    let alert_due = match *last_alert {
+        Some(previous_alert) => now.duration_since(previous_alert) >= ALERT_INTERVAL,
+        None => true,
+    };
 
     if !alert_due {
         return;
@@ -183,9 +207,7 @@ async fn handle_failure(
          Will notify again in 1 minute if it remains down."
     );
 
-    if let Err(error) =
-        send_webhook(client, webhook_url, &message, true).await
-    {
+    if let Err(error) = send_webhook(client, webhook_url, &message, true).await {
         eprintln!("Failed to send Discord webhook for {url}: {error}");
     }
 }
@@ -196,11 +218,7 @@ async fn send_webhook(
     content: &str,
     allow_user_pings: bool,
 ) -> Result<(), reqwest::Error> {
-    let allowed_users: &[&str] = if allow_user_pings {
-        PING_USER_IDS
-    } else {
-        &[]
-    };
+    let allowed_users: &[&str] = if allow_user_pings { PING_USER_IDS } else { &[] };
 
     let payload = json!({
         "username": "Catenary Backend Monitor",
