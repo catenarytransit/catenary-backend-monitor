@@ -8,8 +8,6 @@ use tokio::{
 
 const BACKENDS: &[&str] = &[
     "https://birch.catenarymaps.org",
-    "https://spruce.catenarymaps.org",
-    "https://ramonda.catenarymaps.org",
 ];
 
 const PING_USER_IDS: &[&str] = &["204371573799518208"];
